@@ -1,106 +1,111 @@
 import time
-import cv2
-import os
-from src.utils.logger import get_logger
 from src.services.camera_service import CameraService
 from src.services.serial_service import SerialService
-from src.services.api_service import ApiService
 from src.services.qr_service import QrService
+from src.services.api_service import ApiService
+from src.utils.logger import get_logger
 
 class MainController:
     def __init__(self):
         self.logger = get_logger()
-        self.logger.info("Menginisialisasi Modules...")
         
-        self.camera = CameraService()
-        self.serial = SerialService()
-        self.api = ApiService()
-        self.qr = QrService()
-        
-        # Config
-        self.timeout_limit = int(os.getenv("TIMEOUT_SECONDS", 15))
-        self.points_per_item = int(os.getenv("POINTS_PER_ITEM", 50))
-        
-        # State Variables
-        # self.state = "SCAN_MODE" # SCAN_MODE -> COUNTING_MODE
-        # self.current_user = None
-        self.state = "COUNTING_MODE" 
-        self.current_user = "USER-TESTING-MANUAL"
-        self.total_trash_session = 0
-        self.last_activity_time = time.time()
+        # 1. Inisialisasi Semua Service
+        try:
+            self.camera = CameraService()
+            self.serial = SerialService()
+            self.qr = QrService()
+            self.api = ApiService()
+            self.logger.info("[SYSTEM] Semua service berhasil di-load.")
+        except Exception as e:
+            self.logger.critical(f"[SYSTEM] Gagal inisialisasi: {e}")
+            exit(1)
 
-    def run(self):
-        self.logger.info("=== SYSTEM READY ===")
+    def start(self):
+        """Loop utama aplikasi"""
+        self.logger.info("[SYSTEM] System Ready. Menunggu User...")
         
-        while True:
+        # Pastikan Servo tertutup saat awal nyala
+        self.serial.send_command("CLOSE") 
+
+        try:
+            while True:
+                # Loop ini akan terus berjalan menunggu user baru
+                self.run_session()
+                
+                # Jeda sebentar sebelum siap menerima user berikutnya
+                time.sleep(2) 
+                
+        except KeyboardInterrupt:
+            self.stop()
+
+    def run_session(self):
+        """Menjalankan 1 sesi lengkap dari Scan sampai Tutup"""
+        
+        # --- STEP 1: MENUNGGU SCAN QR ---
+        # Kita ambil frame terus menerus sampai QR ditemukan
+        user_qr_data = None
+        self.logger.info("--- [STEP 1] Menunggu Scan QR... ---")
+        
+        while user_qr_data is None:
             frame = self.camera.get_frame()
-            if frame is None:
-                break
+            if frame is None: continue # Skip jika kamera belum siap
             
-            # --- MODE 1: SCAN QR ---
-            if self.state == "SCAN_MODE":
-                # Tampilkan text instruksi di layar
-                cv2.putText(frame, "SCAN QR CODE ANDA", (50, 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-                
-                qr_data = self.qr.scan(frame)
-                if qr_data:
-                    self.start_session(qr_data)
+            # Cek QR di frame tersebut
+            user_qr_data = self.qr.scan(frame)
+            
+            # Optional: Tambahkan timeout jika tidak ada yg scan (biar gak infinite loop)
+            time.sleep(0.1) 
 
-            # --- MODE 2: HITUNG SAMPAH ---
-            elif self.state == "COUNTING_MODE":
-                # Proses AI (YOLO)
-                frame, new_trash = self.camera.process_ai(frame)
-                
-                if new_trash > 0:
-                    self.total_trash_session += new_trash
-                    self.last_activity_time = time.time() # Reset timer timeout
-                    self.logger.info(f"Sampah Masuk! Total Sesi: {self.total_trash_session}")
-                
-                # Tampilkan info di layar
-                cv2.putText(frame, f"User: {self.current_user}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Total: {self.total_trash_session}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # Cek Timeout (User pergi/selesai)
-                if time.time() - self.last_activity_time > self.timeout_limit:
-                    self.end_session()
-
-            # Tampilkan Window (Tekan Q untuk keluar)
-            cv2.imshow("Smart Trash Monitor", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        self.logger.info(f"[QR] User Terdeteksi: {user_qr_data}")
         
-        self.camera.release()
-        cv2.destroyAllWindows()
-
-    def start_session(self, user_id):
-        self.logger.info(f"Memulai Sesi untuk User: {user_id}")
-        self.current_user = user_id
-        self.total_trash_session = 0
-        self.camera.reset_counter()
+        # --- STEP 2: BUKA TEMPAT SAMPAH ---
+        self.logger.info("--- [STEP 2] Membuka Servo... ---")
+        self.serial.send_command("OPEN")
         
-        # Buka Servo
-        if self.serial.send_command("OPEN"):
-            self.state = "COUNTING_MODE"
-            self.last_activity_time = time.time()
+        # --- STEP 3: WAKTU BUANG SAMPAH ---
+        self.logger.info("--- [STEP 3] Silakan Buang Sampah (5 Detik) ---")
+        time.sleep(5) # Waktu tunggu user membuang sampah
+        
+        # --- STEP 4: AMBIL FOTO & ANALISA ---
+        self.logger.info("--- [STEP 4] Menganalisa Sampah... ---")
+        
+        # Ambil frame terbaru (snapshot)
+        snapshot_frame = self.camera.get_frame()
+        
+        # PENTING: Ini menggunakan method 'analyze_snapshot' yang saya sarankan sebelumnya
+        # Kalau kamu belum update CameraService, method ini harus disesuaikan
+        detected_label, _ = self.camera.analyze_snapshot(snapshot_frame)
+        
+        self.logger.info(f"[AI] Hasil Klasifikasi: {detected_label}")
+
+        # Tentukan poin (Contoh logika sederhana)
+        points = 0
+        if detected_label in ['bottle', 'plastic_bottle']: # Sesuaikan nama class di YOLO kamu
+            points = 10
+        elif detected_label in ['cup']:
+            points = 5
+        
+        # --- STEP 5: KIRIM KE VPS ---
+        self.logger.info("--- [STEP 5] Mengirim Data... ---")
+        if points > 0:
+            self.api.send_transaction(
+                qr_code=user_qr_data,
+                total_trash=1, # Anggap 1 item per sesi
+                points_earned=points
+            )
         else:
-            self.logger.error("Gagal membuka Servo!")
+            self.logger.warning("[AI] Tidak ada sampah valid terdeteksi. Data tidak dikirim.")
 
-    def end_session(self):
-        self.logger.info("Sesi Berakhir (Timeout). Menutup Servo...")
-        
-        # Tutup Servo
+        # --- STEP 6: TUTUP TEMPAT SAMPAH ---
+        self.logger.info("--- [STEP 6] Menutup Servo... ---")
         self.serial.send_command("CLOSE")
         
-        # Hitung Poin
-        points = self.total_trash_session * self.points_per_item
-        
-        # Kirim Data ke VPS
-        if self.total_trash_session > 0:
-            self.api.send_transaction(self.current_user, self.total_trash_session, points)
-        else:
-            self.logger.info("Tidak ada sampah masuk. Transaksi dibatalkan.")
+        self.logger.info("=== Sesi Selesai ===\n")
 
-        # Reset State
-        self.state = "SCAN_MODE"
-        self.current_user = None
+    def stop(self):
+        self.camera.release()
+        self.logger.info("[SYSTEM] Shutdown berhasil.")
+
+if __name__ == "__main__":
+    app = MainController()
+    app.start()
